@@ -23,7 +23,6 @@ import torch.nn as nn
 
 from utils import trunc_normal_
 
-
 def drop_path(x, drop_prob: float = 0., training: bool = False):
     if drop_prob == 0. or not training:
         return x
@@ -253,30 +252,33 @@ def vit_base(patch_size=16, **kwargs):
         qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
     return model
 
+def _build_mlp(nlayers, in_dim, bottleneck_dim, hidden_dim=None, use_bn=False, bias=True):
+    if nlayers == 0:
+        return nn.Identity()
+    elif nlayers == 1:
+        return nn.Linear(in_dim, bottleneck_dim, bias=bias)
+    else:
+        layers = [nn.Linear(in_dim, hidden_dim, bias=bias)]
+        if use_bn:
+            layers.append(nn.BatchNorm1d(hidden_dim))
+        layers.append(nn.GELU())
+        for _ in range(nlayers - 2):
+            layers.append(nn.Linear(hidden_dim, hidden_dim, bias=bias))
+            if use_bn:
+                layers.append(nn.BatchNorm1d(hidden_dim))
+            layers.append(nn.GELU())
+        layers.append(nn.Linear(hidden_dim, bottleneck_dim, bias=bias))
+        return nn.Sequential(*layers)
 
 class DINOHead(nn.Module):
     def __init__(self, in_dim, out_dim, use_bn=False, norm_last_layer=True, nlayers=3, hidden_dim=2048, bottleneck_dim=256):
         super().__init__()
         nlayers = max(nlayers, 1)
-        if nlayers == 1:
-            self.mlp = nn.Linear(in_dim, bottleneck_dim)
-        else:
-            layers = [nn.Linear(in_dim, hidden_dim)]
-            if use_bn:
-                layers.append(nn.BatchNorm1d(hidden_dim))
-            layers.append(nn.GELU())
-            for _ in range(nlayers - 2):
-                layers.append(nn.Linear(hidden_dim, hidden_dim))
-                if use_bn:
-                    layers.append(nn.BatchNorm1d(hidden_dim))
-                layers.append(nn.GELU())
-            layers.append(nn.Linear(hidden_dim, bottleneck_dim))
-            self.mlp = nn.Sequential(*layers)
+        self.mlp = _build_mlp(nlayers, in_dim, bottleneck_dim, hidden_dim=hidden_dim, use_bn=use_bn)
         self.apply(self._init_weights)
-        self.last_layer = nn.utils.weight_norm(nn.Linear(bottleneck_dim, out_dim, bias=False))
-        self.last_layer.weight_g.data.fill_(1)
-        if norm_last_layer:
-            self.last_layer.weight_g.requires_grad = False
+        self.last_layer = nn.Parameter(torch.empty(out_dim, bottleneck_dim))
+        # important!
+        nn.init.normal_(self.last_layer, std=out_dim ** -0.5)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -284,8 +286,12 @@ class DINOHead(nn.Module):
             if isinstance(m, nn.Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x):
+    def forward(self, x, idxs=None):
         x = self.mlp(x)
         x = nn.functional.normalize(x, dim=-1, p=2)
-        x = self.last_layer(x)
+        prototypes = self.last_layer.clone()
+        if idxs is not None:
+            prototypes = prototypes[idxs]
+        prototypes = nn.functional.normalize(prototypes, dim=-1, p=2)
+        x = x @ prototypes.t()
         return x

@@ -34,17 +34,15 @@ import utils
 import vision_transformer as vits
 from vision_transformer import DINOHead
 
-torchvision_archs = sorted(name for name in torchvision_models.__dict__
-    if name.islower() and not name.startswith("__")
-    and callable(torchvision_models.__dict__[name]))
+from dataset import CsvDataset
+import model
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DINO', add_help=False)
 
     # Model parameters
     parser.add_argument('--arch', default='vit_small', type=str,
-        choices=['vit_tiny', 'vit_small', 'vit_base', 'xcit', 'deit_tiny', 'deit_small'] \
-                + torchvision_archs + torch.hub.list("facebookresearch/xcit:main"),
         help="""Name of architecture to train. For quick experiments with ViTs,
         we recommend using vit_tiny or vit_small.""")
     parser.add_argument('--patch_size', default=16, type=int, help="""Size in pixels
@@ -117,6 +115,7 @@ def get_args_parser():
         Used for small local view cropping of multi-crop.""")
 
     # Misc
+    parser.add_argument('--dataset', default='imagenet', type=str, help="Name of the dataset used.")
     parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
         help='Please specify path to the ImageNet training data.')
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
@@ -126,6 +125,8 @@ def get_args_parser():
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
+
+    parser.add_argument("--sample_num", default=0, type=int, help="Number of prototypes to calculate the loss.")
     return parser
 
 
@@ -142,7 +143,12 @@ def train_dino(args):
         args.local_crops_scale,
         args.local_crops_number,
     )
-    dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    if args.dataset == 'imagenet':
+        dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    elif args.data_path.endswith('.csv') or args.data_path.endswith('.tsv'):
+        dataset = CsvDataset(args.data_path, transform=transform)
+    else:
+        raise NotImplementedError(f"Dataset {args.dataset} not supported")
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -157,8 +163,12 @@ def train_dino(args):
     # ============ building student and teacher networks ... ============
     # we changed the name DeiT-S for ViT-S to avoid confusions
     args.arch = args.arch.replace("deit", "vit")
+    if args.arch in model.__dict__.keys():
+        student = model.__dict__[args.arch]()
+        teacher = model.__dict__[args.arch]()
+        embed_dim = student.output_dim
     # if the network is a Vision Transformer (i.e. vit_tiny, vit_small, vit_base)
-    if args.arch in vits.__dict__.keys():
+    elif args.arch in vits.__dict__.keys():
         student = vits.__dict__[args.arch](
             patch_size=args.patch_size,
             drop_path_rate=args.drop_path_rate,  # stochastic depth
@@ -314,9 +324,13 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images]
         # teacher and student forward passes + compute dino loss
+        if args.sample_num > 0:
+            idxs = torch.randperm(args.out_dim)[:args.sample_num].cuda()
+        else:
+            idxs = None
         with torch.cuda.amp.autocast(fp16_scaler is not None):
-            teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
-            student_output = student(images)
+            teacher_output = teacher(images[:2], idxs=idxs)  # only the 2 global views pass through the teacher
+            student_output = student(images, idxs=idxs)
             loss = dino_loss(student_output, teacher_output, epoch)
 
         if not math.isfinite(loss.item()):
@@ -368,7 +382,7 @@ class DINOLoss(nn.Module):
         self.student_temp = student_temp
         self.center_momentum = center_momentum
         self.ncrops = ncrops
-        self.register_buffer("center", torch.zeros(1, out_dim))
+        # self.register_buffer("center", torch.zeros(1, out_dim))
         # we apply a warm up for the teacher temperature because
         # a too high temperature makes the training instable at the beginning
         self.teacher_temp_schedule = np.concatenate((
@@ -386,7 +400,8 @@ class DINOLoss(nn.Module):
 
         # teacher centering and sharpening
         temp = self.teacher_temp_schedule[epoch]
-        teacher_out = F.softmax((teacher_output - self.center) / temp, dim=-1)
+        # teacher_out = F.softmax((teacher_output - self.center) / temp, dim=-1)
+        teacher_out = self.sinkhorn_knopp_teacher(teacher_output, temp)
         teacher_out = teacher_out.detach().chunk(2)
 
         total_loss = 0
@@ -400,20 +415,50 @@ class DINOLoss(nn.Module):
                 total_loss += loss.mean()
                 n_loss_terms += 1
         total_loss /= n_loss_terms
-        self.update_center(teacher_output)
+        # self.update_center(teacher_output)
         return total_loss
 
+    # we use sinkhorn here for better adaptivity
     @torch.no_grad()
-    def update_center(self, teacher_output):
-        """
-        Update center used for teacher output.
-        """
-        batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
-        dist.all_reduce(batch_center)
-        batch_center = batch_center / (len(teacher_output) * dist.get_world_size())
+    def sinkhorn_knopp_teacher(self, teacher_output, teacher_temp, n_iterations=3):
+        teacher_output = teacher_output.float()
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        Q = torch.exp(teacher_output / teacher_temp).t()  # Q is K-by-B for consistency with notations from our paper
+        B = Q.shape[1] * world_size  # number of samples to assign
+        K = Q.shape[0]  # how many prototypes
 
-        # ema update
-        self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
+        # make the matrix sums to 1
+        sum_Q = torch.sum(Q)
+        if dist.is_initialized():
+            dist.all_reduce(sum_Q)
+        Q /= sum_Q
+
+        for it in range(n_iterations):
+            # normalize each row: total weight per prototype must be 1/K
+            sum_of_rows = torch.sum(Q, dim=1, keepdim=True)
+            if dist.is_initialized():
+                dist.all_reduce(sum_of_rows)
+            Q /= sum_of_rows
+            Q /= K
+
+            # normalize each column: total weight per sample must be 1/B
+            Q /= torch.sum(Q, dim=0, keepdim=True)
+            Q /= B
+
+        Q *= B  # the columns must sum to 1 so that Q is an assignment
+        return Q.t()
+
+    # @torch.no_grad()
+    # def update_center(self, teacher_output):
+    #     """
+    #     Update center used for teacher output.
+    #     """
+    #     batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
+    #     dist.all_reduce(batch_center)
+    #     batch_center = batch_center / (len(teacher_output) * dist.get_world_size())
+    # 
+    #     # ema update
+    #     self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
 
 
 class DataAugmentationDINO(object):

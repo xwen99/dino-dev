@@ -607,7 +607,7 @@ class MultiCropWrapper(nn.Module):
         self.backbone = backbone
         self.head = head
 
-    def forward(self, x):
+    def forward(self, x, idxs=None):
         # convert to list
         if not isinstance(x, list):
             x = [x]
@@ -626,7 +626,7 @@ class MultiCropWrapper(nn.Module):
             output = torch.cat((output, _out))
             start_idx = end_idx
         # Run the head forward on the concatenated features.
-        return self.head(output)
+        return self.head(output, idxs)
 
 
 def get_params_groups(model):
